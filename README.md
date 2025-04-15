@@ -1,6 +1,4 @@
-<<<<<<< HEAD
 # Automated-Industrial_Parts_Picking_Robot
-=======
 ![alt text](image.png)
 # Automated Screw Sorting System
 *Last updated: 21/03/2025*

@@ -1,6 +1,6 @@
-train: /home/khoa_is_sleep/screws/DATA/data_train  # Thư mục ảnh huấn luyện
+train: /home/khoa_is_sleep/screws/DATA/data_new  # Thư mục ảnh huấn luyện
 val: /home/khoa_is_sleep/screws/DATA/data_val      # Thư mục ảnh để đánh giá
 nc: 2             # Số lượng lớp (đổi từ 1 -> 2)
 names:
-  - label_1       # Thay bằng tên label thực tế
-  - label_2       # Thay bằng tên label thực tế
+  - screw1       # Ốc vít nhỏ
+  - screw2       # Ốc vít lớn

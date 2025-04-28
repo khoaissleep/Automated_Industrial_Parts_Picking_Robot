@@ -18,7 +18,7 @@ from ultralytics import YOLO
 
 # Thêm lớp RotatedDetector từ trackingvideo.py
 class RotatedDetector:
-    def __init__(self, model_path: str, conf_threshold: float = 0.25,
+    def __init__(self, model_path: str, conf_threshold: float = 0,
                  morph_kernel_size: int = 3, tracking: bool = True,
                  resize_factor: float = 1.0, skip_frames: int = 0):
         """
@@ -48,12 +48,68 @@ class RotatedDetector:
         except Exception as e:
             raise RuntimeError(f"Failed to load model: {e}")
 
+    def _calculate_custom_center(self, pts, label):
+        """
+        Tính toán tâm tùy chỉnh dựa trên label.
+        Đối với screw2, chia theo chiều dài thành 3 phần và lấy tâm ở 1/3 ngoài cùng.
+        """
+        # Tính toán tâm thông thường
+        default_cx = int(np.mean(pts[:, 0]))
+        default_cy = int(np.mean(pts[:, 1]))
+        
+        # Nếu không phải screw2, trả về tâm thông thường
+        if label != "screw2":
+            return default_cx, default_cy
+            
+        # Với screw2, tính toán tâm theo yêu cầu
+        # Tìm chiều dài và chiều rộng của rotated box
+        rect = cv2.minAreaRect(pts)
+        (center_x, center_y), (width, height), angle = rect
+        
+        # Đảm bảo width là chiều dài (lớn hơn)
+        length = max(width, height)
+        width = min(width, height)
+        
+        # Tính toán vector chỉ hướng của chiều dài
+        if width != height:  # Chỉ khi không phải hình vuông
+            if width < height:  # Nếu chiều cao > chiều rộng
+                angle += 90  # Điều chỉnh góc
+                
+        # Chuyển góc từ độ sang radian
+        angle_rad = np.deg2rad(angle)
+        
+        # Vector đơn vị dọc theo chiều dài
+        dx = np.cos(angle_rad)
+        dy = np.sin(angle_rad)
+        
+        # Luôn lấy tâm ở phần 1/3 bên phải
+        direction = 1
+        
+        # Tính toán tâm mới: từ tâm hiện tại dịch chuyển 1/3 chiều dài
+        # theo hướng đã chọn
+        new_cx = int(center_x + direction * (length/3) * dx)
+        new_cy = int(center_y + direction * (length/3) * dy)
+        
+        return new_cx, new_cy
+
     def _get_rotated_bbox(self, img: np.ndarray, bbox: np.ndarray):
         """Tính toán rotated bounding box sử dụng Otsu thresholding."""
         x1, y1, x2, y2 = bbox.astype(int)
         roi = img[y1:y2, x1:x2]
         if roi.size == 0:
-            return None
+            return None, None
+
+        # Kiểm tra màu vàng trước khi xử lý roi
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        # Mở rộng khoảng màu vàng để bao gồm cả màu vàng cam và vàng chanh
+        yellow_lower = np.array([15, 70, 70])   # Giảm H, S, V để bắt các màu vàng nhạt và vàng cam
+        yellow_upper = np.array([40, 255, 255]) # Tăng H để bắt màu vàng chanh và vàng xanh
+        yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
+        yellow_ratio = cv2.countNonZero(yellow_mask) / (roi.shape[0] * roi.shape[1] + 1e-5)
+        
+        # Nếu có màu vàng hoặc màu gần giống, loại bỏ
+        if yellow_ratio > 0.05:  # Giữ ngưỡng 5% pixel
+            return None, None
 
         try:
             # Sử dụng kích thước nhỏ hơn cho Gaussian Blur để tăng tốc
@@ -61,18 +117,31 @@ class RotatedDetector:
             blurred = cv2.GaussianBlur(gray, (3, 3), 0)
             _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         except cv2.error:
-            return None
+            return None, None
 
         kernel = np.ones((self.morph_kernel_size,)*2, np.uint8)
         cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
         cleaned = cv2.bitwise_not(cleaned)
         contours = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
         if not contours:
-            return None
+            return None, None
 
         max_contour = max(contours, key=cv2.contourArea)
         rect = cv2.minAreaRect(max_contour)
-        return np.intp(cv2.boxPoints(rect)) + [x1, y1]
+        rotated_box = np.intp(cv2.boxPoints(rect)) + [x1, y1]
+        
+        # Trả về cả rotated_box và góc
+        angle = rect[2]
+        
+        # Điều chỉnh góc để phù hợp với chiều dọc
+        width, height = rect[1]
+        if width < height:
+            angle = angle + 90
+        
+        # Chuẩn hóa góc về khoảng 0-180
+        angle = angle % 180
+        
+        return rotated_box, angle
 
     def process_frame(self, frame: np.ndarray) -> tuple:
         """
@@ -110,14 +179,19 @@ class RotatedDetector:
             color = self.colors.get(cls_id, (255, 255, 255))
             
             # Chỉ tính rotated box cho các object có confidence cao
-            rotated_box = self._get_rotated_bbox(frame, box)
+            rotated_box, angle = self._get_rotated_bbox(frame, box)
             if rotated_box is not None:
                 cv2.drawContours(processed_img, [rotated_box], 0, (0, 255, 255), 2)
-                # Tính tâm của rotated box
-                center_x = int(np.mean(rotated_box[:, 0]))
-                center_y = int(np.mean(rotated_box[:, 1]))
+                
+                # Sử dụng phương thức tính tâm tùy chỉnh
+                center_x, center_y = self._calculate_custom_center(rotated_box, label)
+                
                 # Tính diện tích của rotated box
                 area = cv2.contourArea(rotated_box)
+                
+                # Lọc theo diện tích, chỉ giữ lại các vật thể có diện tích từ 1400 đến 2000
+                if area < 1400 or area > 2000:
+                    continue
                 
                 # Thêm thông tin vào detection_data
                 detection_data.append({
@@ -128,12 +202,16 @@ class RotatedDetector:
                     "rotated_bbox": rotated_box,
                     "center": (center_x, center_y),
                     "area": area,
-                    "class_id": int(cls_id)  # Thêm class_id vào detection_data
+                    "class_id": int(cls_id),  # Thêm class_id vào detection_data
+                    "angle": angle
                 })
                 
                 # Vẽ tọa độ tâm
                 cv2.circle(processed_img, (center_x, center_y), 3, (0, 0, 255), -1)
-                text = f"ID:{track_id if track_id is not None else 'N/A'} {label}"
+                # Chuyển đổi tọa độ sang tọa độ robot
+                cxn = center_y * x_scale - x_offset  # swap - scale - offset x
+                cyn = center_x * y_scale - y_offset  # swap - scale - offset y
+                text = f"ID:{track_id if track_id is not None else 'N/A'} {label} Angle:{angle:.1f} ({cxn:.1f},{cyn:.1f})"
                 cv2.putText(processed_img, text, (center_x, center_y - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
@@ -177,7 +255,7 @@ class BaslerCamera:
         self.transform_file = 'camera_transform.json'
         self.load_transform()
         # Thay thế mô hình YOLO bằng RotatedDetector
-        self.detector = RotatedDetector('test_screws.pt', conf_threshold=0.4, tracking=True)
+        self.detector = RotatedDetector('D:/Huy/DeltaX/Source/Component/test_screws.pt', conf_threshold=0, tracking=True)
         print("Screw detector loaded successfully")
 
     def start_camera(self):
@@ -352,8 +430,14 @@ class RobotGUI:
         # Frame cho Command Window trong Auto Mode
         self.auto_response_frame = ttk.LabelFrame(self.auto_tab, text="Command Window")
         self.auto_response_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.auto_response_text = tk.Text(self.auto_response_frame, height=20)
+        
+        # Thêm scrollbar cho Command Window
+        self.auto_scrollbar = ttk.Scrollbar(self.auto_response_frame)
+        self.auto_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.auto_response_text = tk.Text(self.auto_response_frame, height=20, yscrollcommand=self.auto_scrollbar.set)
         self.auto_response_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.auto_scrollbar.config(command=self.auto_response_text.yview)
 
         # Tab Manual Mode
         self.manual_tab = ttk.Frame(self.notebook)
@@ -589,11 +673,11 @@ class RobotGUI:
     def toggle_gripper(self):
         """Toggle gripper on/off"""
         if not self.gripper_state:  # Nếu đang Off -> chuyển On
-            self.send_gcode("M03 D1")
+            self.send_gcode("M03 D0")
             self.gripper_btn.config(text="Gripper: ON")
             self.gripper_state = True
         else:  # Nếu đang On -> chuyển Off
-            self.send_gcode("M05 D1")
+            self.send_gcode("M05 D0")
             self.gripper_btn.config(text="Gripper: OFF")
             self.gripper_state = False
 
@@ -610,16 +694,19 @@ class RobotGUI:
 
     def toggle_camera(self):
         """Toggle camera on/off"""
+        global object_tracks
         if not self.camera_state:
             self.update_manual_response("Opening camera...")
             self.camera_btn.config(text="Camera: ON")
             self.camera_state = True
+            object_tracks.clear()  # Làm mới danh sách object_tracks khi bật camera
             self.basler_camera.start_camera()
             self.update_camera_loop()
         else:
             self.update_manual_response("Camera stopped")
             self.camera_btn.config(text="Camera: OFF")
             self.camera_state = False
+            object_tracks.clear()  # Làm mới danh sách object_tracks khi tắt camera
             self.basler_camera.stop_camera()
             self.camera_label.configure(image='')
             self.camera_label.image = None
@@ -636,60 +723,167 @@ class RobotGUI:
                 # Tạo overlay để hiển thị
                 overlay = processed_img.copy()
                 frame_detections = []
+                
+                # Danh sách các tâm đã sử dụng để tránh vẽ chồng lên nhau
+                used_centers = []
 
                 # Xử lý các detection từ detector
                 for detection in detection_data:
-                    center_x, center_y = detection["center"]
-                    area = detection["area"]
-                    track_id = detection["track_id"]
-                    score = detection["score"]
-                    label = detection["label"]
-                    # Lấy class_id từ detector nếu có sẵn, nếu không thì thử lấy từ label
-                    if "class_id" in detection:
-                        cls_id = detection["class_id"]
-                    else:
-                        try:
-                            cls_id = self.basler_camera.detector.class_names.index(label) if label in self.basler_camera.detector.class_names else -1
-                        except:
-                            cls_id = -1  # Mặc định nếu không xác định được
-                    
-                    # Chuyển đổi tọa độ sang tọa độ robot
-                    cxn = center_y * x_scale - x_offset  # swap - scale - offset x
-                    cyn = center_x * y_scale - y_offset  # swap - scale - offset y
-                    
-                    # Thêm vào danh sách detections để cập nhật track
-                    # Bổ sung thêm label vào detection để phân loại
-                    frame_detections.append((center_x, center_y, 100, area, cls_id))
+                    # Lấy rotated_bbox từ detection
+                    rotated_box = detection.get("rotated_bbox")
+                    if rotated_box is not None:
+                        # Lấy vùng chứa toàn bộ object để kiểm tra màu
+                        x1, y1 = np.min(rotated_box, axis=0)
+                        x2, y2 = np.max(rotated_box, axis=0)
+                        x1, y1 = max(x1, 0), max(y1, 0)
+                        x2, y2 = min(x2, processed_img.shape[1]), min(y2, processed_img.shape[0])
+                        obj_roi = processed_img[int(y1):int(y2), int(x1):int(x2)]
+                        
+                        # Kiểm tra màu vàng trên toàn bộ object
+                        if obj_roi.size > 0:  # Đảm bảo ROI không rỗng
+                            hsv = cv2.cvtColor(obj_roi, cv2.COLOR_BGR2HSV)
+                            # Khoảng giá trị HSV cho màu vàng
+                            yellow_lower = np.array([15, 70, 70])   # Giảm H, S, V để bắt các màu vàng nhạt và vàng cam
+                            yellow_upper = np.array([40, 255, 255]) # Tăng H để bắt màu vàng chanh và vàng xanh
+                            yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
+                            yellow_ratio = cv2.countNonZero(yellow_mask) / (obj_roi.shape[0] * obj_roi.shape[1] + 1e-5)
+                            
+                            # Bỏ qua vật thể có màu vàng (với ngưỡng nhỏ)
+                            if yellow_ratio > 0.05:  # Ngưỡng 5%
+                                continue
+                        
+                        # Tính tâm tùy chỉnh
+                        label = detection["label"]
+                        cx, cy = self.basler_camera.detector._calculate_custom_center(rotated_box, label)
+                        
+                        # Kiểm tra nếu tâm này quá gần với tâm đã sử dụng thì bỏ qua
+                        if any(np.linalg.norm(np.array([cx, cy]) - np.array(p)) < 10 for p in used_centers):
+                            continue
+                        used_centers.append((cx, cy))
+                        
+                        # Lấy class_id từ detection
+                        track_id = detection.get("track_id")
+                        cls_id = detection.get("class_id", -1)
+                        
+                        # Vẽ rotated box và tâm
+                        cv2.drawContours(overlay, [rotated_box], 0, (0, 255, 255), 2)
+                        cv2.circle(overlay, (cx, cy), 4, (0, 0, 255), -1)
+                        
+                        # Chuyển đổi tọa độ sang tọa độ robot
+                        cxn = cy * x_scale - x_offset  # swap - scale - offset x
+                        cyn = cx * y_scale - y_offset  # swap - scale - offset y
+                        
+                        # Vẽ nhãn
+                        color = self.basler_camera.detector.colors.get(cls_id, (0, 0, 255))
+                        text = f"ID:{track_id} {label} Size:{detection.get('area', 0):.0f} Angle:{detection.get('angle', 0):.1f}° ({cxn:.1f},{cyn:.1f})"
+                        cv2.putText(overlay, text, (cx + 5, cy - 5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+                        
+                        # Thêm vào danh sách detections để cập nhật track
+                        frame_detections.append((cx, cy, 100, detection.get('area', 0), cls_id, detection.get('angle', 0)))
+                        # Lưu rotated_bbox vào detection để sử dụng sau
+                        detection["rotated_bbox"] = rotated_box
 
                 # -------------------------------------
                 # (B) Update object tracks với frame_detections
                 # -------------------------------------
-                self.match_or_create_tracks(frame_detections, max_dist=20)
+                self.match_or_create_tracks(frame_detections, max_dist=15)
 
-                self.update_manual_response("", clear=True)
-                self.update_manual_response(f"Quantity: {len(frame_detections)}")  # số vật thể trên màn hình
+                # Hiển thị thông tin vật thể trong Command Window của Auto Mode
+                if self.notebook.index(self.notebook.select()) == self.notebook.index(self.auto_tab):
+                    self.update_auto_response("", clear=True)
+                    self.update_auto_response("===== OBJECTS DETECTED =====")
+                    self.update_auto_response(f"Quantity: {len(frame_detections)}")
+                    self.update_auto_response("----------------------------------------")
+                    
+                    # Hiển thị thông tin từ camera view
+                    if len(detection_data) > 0:
+                        self.update_auto_response("CAMERA VIEW DETECTIONS:")
+                        for detection in detection_data:
+                            if "rotated_bbox" in detection:
+                                track_id = detection.get("track_id", "N/A")
+                                label = detection.get("label", "Unknown")
+                                area = detection.get("area", 0)
+                                cx, cy = detection.get("center", (0, 0))
+                                angle = detection.get("angle", 0)
+                                
+                                # Chuyển đổi tọa độ sang tọa độ robot
+                                cxn = cy * x_scale - x_offset  # swap - scale - offset x
+                                cyn = cx * y_scale - y_offset  # swap - scale - offset y
+                                
+                                # Hiển thị thông tin từ camera view
+                                text = f"ID:{track_id} {label} Size:{area:.0f} Angle:{angle:.1f}° ({cxn:.1f},{cyn:.1f})"
+                                self.update_auto_response(text)
+                        self.update_auto_response("----------------------------------------")
+                    
+                    # Lưu rotated_bbox từ detection vào object_tracks
+                    for detection in detection_data:
+                        if "track_id" in detection and "rotated_bbox" in detection:
+                            track_id = detection["track_id"]
+                            for obj_id, data in object_tracks.items():
+                                if obj_id == track_id:
+                                    data["rotated_bbox"] = detection["rotated_bbox"]
+                    
+                    # Hiển thị thông tin từ object tracks
+                    self.update_auto_response("OBJECT TRACKS:")
+                    for obj_id, data in object_tracks.items():
+                        cx, cy = data['center']
+                        cxn = cy * x_scale - x_offset           # swap - scale - offset x
+                        cyn = cx * y_scale - y_offset           # swap - scale - offset y
+                        area = data.get('area', 0)
+                        cls_id = data.get('class_id', -1)
+                        angle = data.get('angle', 0)  # Lấy góc từ data
+                        label = self.basler_camera.detector.class_names[cls_id] if 0 <= cls_id < len(self.basler_camera.detector.class_names) else "Unknown"
+                        
+                        # Hiển thị trên Command Window
+                        text = f"ID:{obj_id} {label} Size:{area:.0f} Angle:{angle:.1f}° ({cxn:.1f},{cyn:.1f})"
+                        self.update_auto_response(text)
+                    
+                    self.update_auto_response("----------------------------------------")
+                    # Buộc cập nhật GUI
+                    self.auto_response_text.update()
+                
+                # Vẽ thông tin lên overlay
+                cv2.putText(overlay, f"Objects: {len(frame_detections)}", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
                 for obj_id, data in object_tracks.items():
                     cx, cy = data['center']
                     cxn = cy * x_scale - x_offset           # swap - scale - offset x
                     cyn = cx * y_scale - y_offset           # swap - scale - offset y
+                    color = self.basler_camera.detector.colors.get(data.get('class_id', -1), (0, 0, 255))
+                    
+                    # Vẽ thông tin lên overlay
+                    # Vẽ rotated box
+                    if 'rotated_bbox' in data:
+                        cv2.drawContours(overlay, [data['rotated_bbox']], 0, color, 2)
+                    # Vẽ tâm
+                    cv2.circle(overlay, (int(cx), int(cy)), 4, color, -1)
+                    
+                    # Lấy các thông tin
                     area = data.get('area', 0)
                     cls_id = data.get('class_id', -1)
-                    label = self.basler_camera.detector.class_names[cls_id] if 0 <= cls_id < len(self.basler_camera.detector.class_names) else "Unknown"
+                    angle = data.get('angle', 0)
+                    label = self.basler_camera.detector.class_names[data.get('class_id', -1)] if 0 <= data.get('class_id', -1) < len(self.basler_camera.detector.class_names) else "Unknown"
                     
-                    text = f"Id:{obj_id} \t Class:{label} \t Area:{area:.0f} \t ({cxn:.1f} ; {cyn:.1f})"
-                    self.update_manual_response(text)
+                    # Chuyển đổi tọa độ sang tọa độ robot
+                    cxn = cy * x_scale - x_offset  # swap - scale - offset x
+                    cyn = cx * y_scale - y_offset  # swap - scale - offset y
                     
-                    # Hiển thị ID và tâm của đối tượng
-                    color = self.basler_camera.detector.colors.get(cls_id, (0, 0, 255))
-                    cv2.putText(overlay, f"Id:{obj_id} {label}", (int(cx)-10, int(cy)-18), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-                    cv2.circle(overlay, (int(cx), int(cy)), 5, color, -1)
+                    # Vẽ thông tin
+                    info_text = f"ID:{obj_id} {label} Size:{area:.0f} Angle:{angle:.1f}° ({cxn:.1f},{cyn:.1f})"
+                    cv2.putText(overlay, info_text, (cx + 5, cy - 5),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-                    #-------------------------------------------------------------------------------------------------#
-                    #------------------------------------- Classification output -------------------------------------#
-                    #-------------------------------------------------------------------------------------------------#
-                    if enable_grip:
+                #-------------------------------------------------------------------------------------------------#
+                #------------------------------------- Classification output -------------------------------------#
+                #-------------------------------------------------------------------------------------------------#
+                if enable_grip:
+                    for obj_id, data in object_tracks.items():
+                        cx, cy = data['center']
+                        cxn = cy * x_scale - x_offset           # swap - scale - offset x
+                        cyn = cx * y_scale - y_offset           # swap - scale - offset y
+                        
                         cx_moving = cxn - conveyor_offset
                         cy_moving = cyn
                         
@@ -727,22 +921,34 @@ class RobotGUI:
         if self.camera_state:
             self.root.after(30, self.update_camera_loop)
 
-    def match_or_create_tracks(self,detections, max_dist=20, alpha=0.1, max_missed_frames= 20):
+    def match_or_create_tracks(self, detections, max_dist=20, alpha=0.1, max_missed_frames=15):
         """
-        detections: list of (cx, cy, closeness, area, class_id)
+        detections: list of (cx, cy, closeness, area, class_id, angle)
         For each detection, if an existing track's center is within max_dist,
         update that track. Otherwise, create a new track with a new unique ID.
 
         alpha: smoothing factor for updating the 'closeness' metric.
         """
         global next_id
-        next_id = max(object_tracks.keys()) + 1 if object_tracks else 1
+        global object_tracks  # Đảm bảo object_tracks là global
+        
+        if not object_tracks:  # Nếu object_tracks rỗng, bắt đầu với ID 1
+            next_id = 1
+        else:
+            next_id = max(object_tracks.keys()) + 1 if object_tracks else 1
+            
         # Mark all existing tracks as not matched for this frame
         for track in object_tracks.values():
             track['matched'] = False
 
         # For each detection, try to find an existing track within threshold.
-        for (cx, cy, closeness, area, cls_id) in detections:
+        for detection in detections:
+            if len(detection) >= 6:  # Kiểm tra xem detection có đủ phần tử không
+                cx, cy, closeness, area, cls_id, angle = detection
+            else:
+                cx, cy, closeness, area, cls_id = detection
+                angle = 0  # Giá trị mặc định nếu không có góc
+                
             updated = False
             for track_id, track in object_tracks.items():
                 tx, ty = track['center']
@@ -753,6 +959,7 @@ class RobotGUI:
                     track['center'] = (cx, cy)
                     track['area'] = area
                     track['class_id'] = cls_id  # Cập nhật class_id
+                    track['angle'] = angle      # Cập nhật góc
                     # Không cần cập nhật closeness nữa
                     track['frames_seen'] += 1
                     track['missed_frames'] = 0
@@ -766,6 +973,7 @@ class RobotGUI:
                     'center': (cx, cy),
                     'area': area,
                     'class_id': cls_id,  # Lưu class_id
+                    'angle': angle,      # Lưu góc
                     'frames_seen': 1,
                     'closeness': 100,  # Giá trị mặc định
                     'missed_frames': 0,
@@ -787,13 +995,30 @@ class RobotGUI:
 #----------------------------------------------------------------------------------#
 #------------------------------------ Auto mode -----------------------------------#
 #----------------------------------------------------------------------------------#
+    def force_update_gui(self):
+        """Buộc cập nhật GUI ngay lập tức"""
+        self.root.update()
+        self.root.update_idletasks()
+
     def toggle_auto_mode(self):
         """Toggle auto mode on/off"""
+        global object_tracks
         if not self.auto_running:
+            # Chuyển sang tab Auto Mode
+            self.notebook.select(self.auto_tab)
+            
             self.update_auto_response("Running auto screw sorter...")
             self.auto_running = True
             self.auto_btn.config(text="STOP")
 
+            # Hiển thị thông tin ban đầu
+            self.update_auto_response("", clear=True)
+            self.update_auto_response("===== OBJECTS DETECTED =====")
+            self.update_auto_response("Waiting for objects...")
+            self.update_auto_response("----------------------------------------")
+            self.force_update_gui()
+
+            # Sau đó mới điều khiển robot và conveyor
             self.send_gcode(f"G01 X0 Y0 Z{z_grip + move_up} F{velo} A{acce}")   # Robot home
             self.send_gcode("M05 D1")                                           # Gripper off
             self.send_gcode_to_conveyor(f"M311 {conveyor_velo}")                # Start conveyor
@@ -803,6 +1028,7 @@ class RobotGUI:
             self.picked_label.config(text=f"Picked screws: {self.picked_count}")
 
             self.camera_state = True
+            object_tracks.clear()  # Làm mới danh sách object_tracks khi bật chế độ tự động
             self.basler_camera.start_camera()
             self.update_camera_loop(enable_grip=True)
         else:
@@ -819,6 +1045,7 @@ class RobotGUI:
 
             # Tắt camera
             self.camera_state = False
+            object_tracks.clear()  # Làm mới danh sách object_tracks khi tắt chế độ tự động
             self.basler_camera.stop_camera()
             self.camera_label.configure(image='')
             self.camera_label.image = None
@@ -849,6 +1076,7 @@ class RobotGUI:
 
     def toggle_calibrate_mode(self):
         """Toggle calibrate mode on/off"""
+        global object_tracks
         if not self.calibrate_running:
             # Start calibrate mode
             self.calibrate_running = True
@@ -863,6 +1091,7 @@ class RobotGUI:
             # Start camera và hiển thị hướng dẫn
             if not self.basler_camera.grabbing:
                 if self.basler_camera.start_camera():
+                    object_tracks.clear()  # Làm mới danh sách object_tracks khi bật chế độ hiệu chuẩn
                     self.update_calibrate_response("Calibration Mode Started")
                     self.update_calibrate_response("\nClick points in order:")
                     self.update_calibrate_response("1. (-80,-80)  2. (0,-80)   3. (80,-80)")
@@ -875,6 +1104,7 @@ class RobotGUI:
 
     def stop_calibrate_mode(self):
         """Stop calibrate mode"""
+        global object_tracks
         self.calibrate_running = False
         self.calibrate_btn.config(text="START")
         self.update_btn.config(state='disabled')
@@ -896,6 +1126,7 @@ class RobotGUI:
 
         # Tắt camera
         if self.basler_camera.grabbing:
+            object_tracks.clear()  # Làm mới danh sách object_tracks khi tắt chế độ hiệu chuẩn
             self.basler_camera.stop_camera()
             self.camera_label.configure(image='')
             self.camera_label.image = None
@@ -1065,10 +1296,15 @@ class RobotGUI:
 
     def update_auto_response(self, text, clear=False):
         """Command window in AUTO MODE"""
-        self.auto_response_text.insert(tk.END, text + "\n")
-        self.auto_response_text.see(tk.END)
-        if clear:
-            self.auto_response_text.delete(1.0, tk.END)
+        try:
+            if clear:
+                self.auto_response_text.delete(1.0, tk.END)
+            self.auto_response_text.insert(tk.END, text + "\n")
+            self.auto_response_text.see(tk.END)
+            # Buộc cập nhật ngay lập tức
+            self.auto_response_text.update_idletasks()
+        except Exception as e:
+            print(f"Error updating auto response: {e}")
 
     def update_calibrate_response(self, text):
         """Command window in CALIB MODE"""
@@ -1102,21 +1338,8 @@ class RobotGUI:
         self.suppress_response = True  # Bắt đầu ngăn phản hồi
         if x > -345:
             try:
-                # pick & grip
-                self.send_gcode(f"G01 X{x} Y{y} Z{z_grip + move_up} F{velo} A{acce}")
-                self.send_gcode(f"G01 X{x} Y{y} Z{z_grip} F800 A1500")
-                self.send_gcode("M03 D1")
-                time.sleep(0.2)
-                # move up
-                self.send_gcode(f"G01 X{x} Y{y} Z{z_grip + move_up} F{velo} A{acce}")
-                # place
-                if no == 1: self.send_gcode(f"G01 X{x_re1} Y{y_re1} Z{z_re1} F{velo} A{acce}")
-                elif no == 2: self.send_gcode(f"G01 X{x_re2} Y{y_re2} Z{z_re2} F{velo} A{acce}")
-                # ungrip & home
-                self.send_gcode("M05 D1")
-                time.sleep(0.2)
-                # self.send_gcode(f"G01 X0 Y0 Z{z_grip + move_up} F{velo} A{acce}")
-                self.update_response(f"Picked at ({x: .1f}, {y: .1f}) to Receiver {no}")
+                # pick & grip -223.5  -52.9
+                self.send_gcode(f"G01 X{x-4} Y{y-3} Z{z_grip + move_up - 65} F{velo} A{acce}")
             finally:
                 self.suppress_response = False  # Kết thúc ngăn phản hồi
                 self.pick_in_progress = False  # End pick and place

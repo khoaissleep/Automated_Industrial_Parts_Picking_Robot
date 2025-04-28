@@ -1,5 +1,3 @@
-# rotated_detector_three_views_full.py
-
 import os
 import sys
 import cv2
@@ -7,6 +5,7 @@ import numpy as np
 from ultralytics import YOLO
 from typing import Optional
 import matplotlib.pyplot as plt
+import random  # Thêm import để sử dụng random
 
 class RotatedDetector:
     def __init__(self, model_path: str, conf_threshold: float = 0.25,
@@ -192,7 +191,51 @@ class RotatedDetector:
             plt.close(fig)
             print(f"\nTổng cộng đã xử lý {process_count}/{frame_count} frames")
 
-    def process_images_folder(self, folder_path: str) -> None:
+    def _calculate_custom_center(self, pts, label):
+        """
+        Tính toán tâm tùy chỉnh dựa trên label.
+        Đối với screw2, chia theo chiều dài thành 3 phần và lấy tâm ở 1/3 ngoài cùng.
+        """
+        # Tính toán tâm thông thường
+        default_cx = int(np.mean(pts[:, 0]))
+        default_cy = int(np.mean(pts[:, 1]))
+        
+        # Nếu không phải screw2, trả về tâm thông thường
+        if label != "screw2":
+            return default_cx, default_cy
+            
+        # Với screw2, tính toán tâm theo yêu cầu
+        # Tìm chiều dài và chiều rộng của rotated box
+        rect = cv2.minAreaRect(pts)
+        (center_x, center_y), (width, height), angle = rect
+        
+        # Đảm bảo width là chiều dài (lớn hơn)
+        length = max(width, height)
+        width = min(width, height)
+        
+        # Tính toán vector chỉ hướng của chiều dài
+        if width != height:  # Chỉ khi không phải hình vuông
+            if width < height:  # Nếu chiều cao > chiều rộng
+                angle += 90  # Điều chỉnh góc
+                
+        # Chuyển góc từ độ sang radian
+        angle_rad = np.deg2rad(angle)
+        
+        # Vector đơn vị dọc theo chiều dài
+        dx = np.cos(angle_rad)
+        dy = np.sin(angle_rad)
+        
+        # Quyết định ngẫu nhiên lấy tâm ở phần 1/3 bên trái hoặc bên phải
+        direction = 1 if random.random() > 0.5 else -1
+        
+        # Tính toán tâm mới: từ tâm hiện tại dịch chuyển 1/3 chiều dài
+        # theo hướng đã chọn
+        new_cx = int(center_x + direction * (length/3) * dx)
+        new_cy = int(center_y + direction * (length/3) * dy)
+        
+        return new_cx, new_cy
+
+    def process_images_3style(self, folder_path: str) -> None:
         """
         Xử lý tất cả ảnh trong thư mục và hiển thị ba ảnh riêng biệt:
         - Ảnh có bounding box
@@ -231,8 +274,9 @@ class RotatedDetector:
             for det in dets:
                 if det["rotated_bbox"] is not None:
                     pts = np.array(det["rotated_bbox"], np.int32).reshape(-1, 2)
-                    cx = int(np.mean(pts[:, 0]))
-                    cy = int(np.mean(pts[:, 1]))
+                    
+                    # Sử dụng phương thức tính tâm tùy chỉnh
+                    cx, cy = self._calculate_custom_center(pts, det["label"])
 
                     # Tránh vẽ trùng label quá gần nhau
                     if any(np.linalg.norm(np.array([cx, cy]) - np.array(p)) < 10 for p in used_centers):
@@ -270,8 +314,8 @@ class RotatedDetector:
         cv2.destroyAllWindows()
     def process_rotated_only(self, folder_path: str) -> None:
         """
-        Xử lý và hiển thị ảnh chỉ với Rotated Boxes + Tâm + Label.
-        Bỏ qua các vật thể có màu vàng.
+        Process and display images showing only Rotated Boxes + Center + Label + Angle.
+        Ignore objects that are mostly yellow.
         """
         valid_ext = (".jpg", ".jpeg", ".png", ".bmp")
         files = [os.path.join(folder_path, f)
@@ -300,17 +344,16 @@ class RotatedDetector:
             for det in dets:
                 if det["rotated_bbox"] is not None:
                     pts = np.array(det["rotated_bbox"], np.int32).reshape(-1, 2)
-                    cx = int(np.mean(pts[:, 0]))
-                    cy = int(np.mean(pts[:, 1]))
+                    cx, cy = self._calculate_custom_center(pts, det["label"])
 
-                    # Cắt ROI từ ảnh resized để kiểm tra màu vàng
+                    # Crop ROI from resized image to check for yellow color
                     x1, y1 = np.min(pts, axis=0)
                     x2, y2 = np.max(pts, axis=0)
                     x1, y1 = max(x1, 0), max(y1, 0)
                     x2, y2 = min(x2, img_small.shape[1]), min(y2, img_small.shape[0])
                     roi = img_small[y1:y2, x1:x2]
 
-                    # Chuyển sang HSV và lọc màu vàng
+                    # Check yellow color in ROI
                     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
                     yellow_lower = np.array([20, 100, 100])
                     yellow_upper = np.array([30, 255, 255])
@@ -318,7 +361,95 @@ class RotatedDetector:
                     yellow_ratio = cv2.countNonZero(yellow_mask) / (roi.shape[0] * roi.shape[1] + 1e-5)
 
                     if yellow_ratio > 0.1:
-                        continue  # Bỏ qua vật thể có nhiều màu vàng
+                        continue  # Skip yellow objects
+
+                    if any(np.linalg.norm(np.array([cx, cy]) - np.array(p)) < 10 for p in used_centers):
+                        continue
+                    used_centers.append((cx, cy))
+
+                    # Calculate angle
+                    rect = cv2.minAreaRect(pts)
+                    angle = rect[2]
+                    if angle < -45:
+                        angle = 90 + angle
+
+                    cls_index = self.class_names.index(det["label"])
+                    color = self.colors.get(cls_index, (0, 255, 255))
+
+                    cv2.drawContours(img_rotated, [pts], 0, color, 2)
+                    cv2.circle(img_rotated, (cx, cy), 4, (0, 0, 255), -1)
+
+                    # Add angle information to label
+                    label_text = f"{det['label']} ({cx},{cy}) {angle:.1f}°"
+                    cv2.putText(img_rotated, label_text, (cx + 5, cy - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+
+            # Show image
+            cv2.imshow("Rotated Boxes Only", img_rotated)
+            print(f"Processing {file} - press any key to continue, q to quit")
+            key = cv2.waitKey(0)
+            if key == ord('q') or key == 27:
+                break
+
+        cv2.destroyAllWindows()
+
+
+    def detect_single_image(self, image_path: str, show_display: bool = True) -> tuple:
+        """
+        Phát hiện đối tượng trong một ảnh được chỉ định bởi đường dẫn.
+        
+        Args:
+            image_path (str): Đường dẫn đến file ảnh cần xử lý.
+            show_display (bool): Hiển thị kết quả nếu True.
+            
+        Returns:
+            tuple: (ảnh đã xử lý, dữ liệu phát hiện)
+        """
+        # Kiểm tra file tồn tại
+        if not os.path.exists(image_path):
+            print(f"Không tìm thấy file: {image_path}")
+            return None, []
+        
+        # Đọc ảnh
+        img = cv2.imread(image_path)
+        if img is None:
+            print(f"Không thể đọc ảnh: {image_path}")
+            return None, []
+            
+        # Resize ảnh
+        img_small = cv2.resize(img, (0, 0), fx=self.resize_factor, fy=self.resize_factor)
+        
+        # Xử lý frame để phát hiện đối tượng
+        processed_img, detection_data = self.process_frame(img)
+        
+        # In thông tin diện tích và góc của các đối tượng
+        print(f"\n===== THÔNG TIN CÁC ĐỐI TƯỢNG =====")
+        for i, det in enumerate(detection_data):
+            if det["rotated_bbox"] is not None:
+                # Tính diện tích
+                rotated_box = np.array(det["rotated_bbox"])
+                area = cv2.contourArea(rotated_box)
+                det["area"] = float(area)
+
+                # Tính góc
+                rect = cv2.minAreaRect(rotated_box)
+                angle = rect[2]
+                if angle < -45:
+                    angle = 90 + angle
+                det["angle"] = float(angle)
+
+                # In thông tin
+                print(f"Đối tượng {i+1} - {det['label']} - Diện tích: {area:.2f} pixel² - Góc nghiêng: {angle:.2f}°")
+        
+        if show_display:
+            # Chuẩn bị ảnh hiển thị với rotated boxes
+            img_display = img_small.copy()
+            used_centers = []
+            
+            for det in detection_data:
+                if det["rotated_bbox"] is not None:
+                    pts = np.array(det["rotated_bbox"], np.int32).reshape(-1, 2)
+                    cx, cy = self._calculate_custom_center(pts, det["label"])
 
                     if any(np.linalg.norm(np.array([cx, cy]) - np.array(p)) < 10 for p in used_centers):
                         continue
@@ -327,25 +458,29 @@ class RotatedDetector:
                     cls_index = self.class_names.index(det["label"])
                     color = self.colors.get(cls_index, (0, 255, 255))
 
-                    cv2.drawContours(img_rotated, [pts], 0, color, 2)
-                    cv2.circle(img_rotated, (cx, cy), 4, (0, 0, 255), -1)
-                    label_text = f"{det['label']} ({cx},{cy})"
-                    cv2.putText(img_rotated, label_text, (cx + 5, cy - 5),
+                    cv2.drawContours(img_display, [pts], 0, color, 2)
+                    cv2.circle(img_display, (cx, cy), 4, (0, 0, 255), -1)
+
+                    area = det.get("area", 0)
+                    angle = det.get("angle", 0)
+                    label_text = f"{det['label']} ({cx},{cy}) - {area:.0f}px² - {angle:.1f}°"
+                    cv2.putText(img_display, label_text, (cx + 5, cy - 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+            
+            # Hiển thị kết quả
+            cv2.imshow("Detected Objects", img_display)
+            print(f"Phát hiện {len(detection_data)} đối tượng trong ảnh: {image_path}")
+            print("Nhấn phím bất kỳ để tiếp tục...")
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        
+        return processed_img, detection_data
 
-            # Hiển thị duy nhất rotated box
-            cv2.imshow("Rotated Boxes Only", img_rotated)
-            print(f"Processing {file} - press any key to next, q to quit")
-            key = cv2.waitKey(0)
-            if key == ord('q') or key == 27:
-                break
-
-        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    model_path = "/home/khoa_is_sleep/screws/Robot_control/test_screws.pt"
-    data_dir   = "/home/khoa_is_sleep/screws/DATA/data_train/images"
+    model_path = "/home/khoa_is_sleep/screws/last (1).pt"
+    data_dir   = "/home/khoa_is_sleep/screws/DATA/Data_screws(origin)/images"
 
     detector = RotatedDetector(
         model_path,
@@ -353,4 +488,7 @@ if __name__ == "__main__":
         skip_frames=1,
         tracking=False
     )
-    detector.process_rotated_only(data_dir)
+    
+    # Sử dụng hàm mới để phát hiện đối tượng trong một ảnh
+    image_path = "/home/khoa_is_sleep/screws/testing.png"
+    detector.detect_single_image(image_path) 

@@ -1,36 +1,37 @@
 from ultralytics import YOLO
+import torch
 
-# Load model YOLO cho object detection (bounding box).
-# Lưu ý: Mô hình này được huấn luyện với dữ liệu annotation dạng bounding box.
-# Nếu dữ liệu ban đầu của bạn là segmentation (polygon hoặc mask),
-# bạn cần chuyển đổi chúng thành bounding box (vd: lấy min/max tọa độ)
-# để file annotation có định dạng chuẩn YOLO (class x_center y_center width height, normalized).
-model = YOLO("/home/khoa_is_sleep/screws/Robot_control/test_screws.pt")  # Sử dụng model pretrained YOLOv8 nano cho detection
+# Đường dẫn file cấu hình dữ liệu
+data_yaml = "/home/khoa_is_sleep/screws/AI_training/data.yaml"
 
-# Huấn luyện mô hình với các tham số đã chọn
+# Kiểm tra CPU
+device = "cpu"
+print(f"Using device: {device}")
+
+# Tải mô hình YOLOv8 segmentation
+model = YOLO("yolov8n-seg.pt")  # Sử dụng mô hình segmentation thay vì detection
+
+# Huấn luyện mô hình
 model.train(
-    data="data.yaml",      # File cấu hình dataset. Đảm bảo trong file này các annotation đã ở định dạng bounding box.
-    task="detect",         # Chỉ định nhiệm vụ là detection (bounding box)
-    epochs=20,             # Số epoch huấn luyện
-    batch=4,               # Batch size
-    imgsz=640,             # Kích thước ảnh tiêu chuẩn cho YOLO
-    device="cpu",          # Chạy trên CPU (nếu không có GPU, trường hợp này sẽ chạy chậm hơn)
-    workers=4,             # Số workers cho dữ liệu (tăng tốc độ xử lý)
-    mosaic=1,              # Bật mosaic augmentation
-    mixup=0.1,             # Áp dụng nhẹ mixup augmentation
-    cache=True,            # Sử dụng cache để train nhanh hơn
-    optimizer="SGD",       # Sử dụng SGD optimizer
-    lr0=0.01,              # Learning rate ban đầu
-    lrf=0.01,              # Learning rate cuối (learning rate final factor)
-    cos_lr=True,           # Sử dụng cosine learning rate scheduling
-    label_smoothing=0.1,   # Áp dụng label smoothing (giúp giảm overfitting)
-    patience=5,            # Early stopping patience
-    save=True,             # Lưu model weights sau training
-    save_period=5,         # Lưu model sau mỗi 5 epoch
-    nbs=64,                # Nominal batch size (nếu cần điều chỉnh learning rate theo batch)
-    overlap_mask=False,    # Tắt overlap mask vì ta chỉ quan tâm đến bounding box
-    multi_scale=True,      # Huấn luyện với multi-scale inputs giúp tăng hiệu quả
-    rect=True              # Sử dụng rectangular training (có thể cải thiện hiệu quả với một số dataset)
+    data=data_yaml,       # File cấu hình dataset
+    epochs=30,           # Tăng số epoch để mô hình học tốt hơn
+    batch=2,              # Batch nhỏ vì train trên CPU
+    imgsz=840,            # Kích thước ảnh
+    device=device,        # Train trên CPU
+    task="segment",       # Chỉ định nhiệm vụ là segmentation
+    conf=0.001,           # Ngưỡng confidence thấp để không bỏ sót vật thể
+    iou=0.45,             # Điều chỉnh IoU threshold
+    cache=True,           # Cache dữ liệu để tăng tốc
+    workers=0,            # Tránh lỗi đa luồng
+    hsv_h=0.015,          # Tăng cường dữ liệu (màu sắc)
+    hsv_s=0.7,
+    hsv_v=0.4,
+    flipud=0.5,           # Lật ngẫu nhiên theo chiều dọc
+    fliplr=0.5,           # Lật ngẫu nhiên theo chiều ngang
+    degrees=10,           # Xoay ảnh ngẫu nhiên
+    translate=0.1,        # Dịch ảnh ngẫu nhiên
+    scale=0.5             # Phóng to/thu nhỏ ảnh ngẫu nhiên
 )
 
-print("Huấn luyện xong!")
+# Xuất mô hình đã huấn luyện
+model.export(format="onnx")

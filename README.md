@@ -1,5 +1,7 @@
 # Automated Industrial Parts Picking Robot
-![Demo Video](assets/demo.gif)
+
+## Video Demo
+[Watch Demo Video](https://drive.google.com/file/d/175u-6_dW3XG8moasKtrp2NS2zgosv0Sg/view?usp=sharing)
 
 ## Overview
 This project implements an automated system for sorting industrial parts (screws) using computer vision and a Delta robot. The system can detect, classify, and sort different types of screws on a moving conveyor belt with high accuracy and efficiency.

@@ -6,6 +6,11 @@
 ## Overview
 This project implements an automated system for sorting screws using computer vision and a robot arm. The system identifies different types of screws on a conveyor belt using a machine learning model, and sorts them into appropriate bins using a Delta robot.
 
+## Video Demo
+[![Watch the video](https://img.youtube.com/vi/YOUR_VIDEO_ID/0.jpg)](https://www.youtube.com/watch?v=YOUR_VIDEO_ID)
+
+*Click the image above to watch the system in action*
+
 ## Features
 - **Real-time Object Detection**: Uses YOLOv8 to detect and classify screws with high accuracy
 - **Object Tracking**: Implements tracking to maintain object identity throughout frames
